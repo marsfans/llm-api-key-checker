@@ -2,7 +2,7 @@
 # @see https://developers.cloudflare.com/workers/wrangler/configuration/
 
 # 项目名称，通常与 package.json 中的 name 字段一致
-name = "api-check"
+# name = "api-check"
 
 # Worker 的主入口文件，包含 Worker 的核心逻辑
 main = "src/index.js"
