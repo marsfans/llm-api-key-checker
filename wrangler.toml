@@ -1,4 +1,4 @@
-# Cloudflare Wrangler 配置文件
+name = "aichecker"# Cloudflare Wrangler 配置文件
 # @see https://developers.cloudflare.com/workers/wrangler/configuration/
 
 # 项目名称，通常与 package.json 中的 name 字段一致
