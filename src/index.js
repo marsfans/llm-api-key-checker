@@ -2,6 +2,17 @@ import { corsHeaders, handleOptions } from './utils/cors.js';
 import { handleWebSocketSession } from './websocket_handler.js';
 import * as modelFetcher from './model_fetchers.js';
 import * as providersData from '../config/providers.json';
+import { checkRateLimit } from './utils/rateLimit.js';
+
+/**
+ * @description 速率限制配置。
+ * WS_RATE: WebSocket 连接频率限制（每个 IP 每分钟最多 10 次连接）。
+ * MODELS_RATE: /models 接口频率限制（每个 IP 每分钟最多 30 次请求）。
+ */
+const RATE_LIMITS = {
+    WS: { maxRequests: 10, windowMs: 60_000 },
+    MODELS: { maxRequests: 30, windowMs: 60_000 },
+};
 
 /**
  * @description Durable Object (DO) 用于从指定的 Cloudflare 区域发起网络请求。
@@ -68,6 +79,32 @@ async function handleModelsRequest(request, env) {
 }
 
 /**
+ * @description 获取客户端 IP 地址，优先使用 Cloudflare 提供的 CF-Connecting-IP。
+ * @param {Request} request - 传入的请求对象。
+ * @returns {string} - 客户端 IP 地址。
+ */
+function getClientIP(request) {
+    return request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0]?.trim() || 'unknown';
+}
+
+/**
+ * @description 创建速率限制超限的响应。
+ * @param {number} retryAfterMs - 建议客户端重试的等待时间（毫秒）。
+ * @param {Request} request - 传入的请求对象。
+ * @param {object} env - 环境变量。
+ * @returns {Response} - 429 响应。
+ */
+function rateLimitResponse(retryAfterMs, request, env) {
+    const headers = corsHeaders(request, env);
+    headers['Retry-After'] = String(Math.ceil(retryAfterMs / 1000));
+    headers['Content-Type'] = 'application/json';
+    return new Response(JSON.stringify({ error: 'Too many requests, please try again later.' }), {
+        status: 429,
+        headers,
+    });
+}
+
+/**
  * @description Cloudflare Worker 的主入口点。
  * 它处理所有传入的 HTTP 请求，并根据路径路由到不同的处理器。
  */
@@ -88,6 +125,13 @@ export default {
                 return new Response('Expected a WebSocket upgrade request', { status: 426 });
             }
 
+            // WebSocket 连接速率限制
+            const clientIP = getClientIP(request);
+            const wsLimit = checkRateLimit(`ws:${clientIP}`, RATE_LIMITS.WS.maxRequests, RATE_LIMITS.WS.windowMs);
+            if (!wsLimit.allowed) {
+                return rateLimitResponse(wsLimit.retryAfterMs, request, env);
+            }
+
             const [client, server] = Object.values(new WebSocketPair());
             
             // 将 WebSocket 会话处理委托给 handler，并确保 Worker 在会话期间保持活动状态
@@ -105,6 +149,12 @@ export default {
 
         // /models 路径用于获取模型列表
         if (pathname === '/models') {
+            // /models 接口速率限制
+            const clientIP = getClientIP(request);
+            const modelsLimit = checkRateLimit(`models:${clientIP}`, RATE_LIMITS.MODELS.maxRequests, RATE_LIMITS.MODELS.windowMs);
+            if (!modelsLimit.allowed) {
+                return rateLimitResponse(modelsLimit.retryAfterMs, request, env);
+            }
             return handleModelsRequest(request, env);
         }
 

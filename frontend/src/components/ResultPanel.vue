@@ -218,7 +218,7 @@ const handleFetchModelsForToken = async (token, event) => {
     try {
         const providerConfigForFetch = {
             currentProvider: configStore.currentProvider,
-            baseUrl: configStore.providerConfigs[configStore.currentProvider].baseUrl,
+            baseUrl: configStore.getCurrentProviderConfig().baseUrl,
             currentRegion: configStore.currentRegion,
         };
         

@@ -13,7 +13,7 @@ const BALANCE_UNAVAILABLE = { balance: -1, message: "有效但无法获取余额
 const balanceCheckers = {
     async checkOpenRouterBalance(token, baseUrl, region, env) {
         const creditsUrl = normalizeBaseUrl(baseUrl).replace("/v1", "") + "/v1/credits";
-        const creditsResponse = await secureProxiedFetch(creditsUrl, { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env);
+        const creditsResponse = await secureProxiedFetch(creditsUrl, { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env, 10000);
         if (creditsResponse.ok) {
             const d = await creditsResponse.json();
             const total = d.data?.total_credits || 0;
@@ -28,7 +28,7 @@ const balanceCheckers = {
         return BALANCE_UNAVAILABLE;
     },
     async checkSiliconFlowBalance(token, baseUrl, region, env) {
-        const resp = await secureProxiedFetch(normalizeBaseUrl(baseUrl).replace("/v1", "") + "/v1/user/info", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env);
+        const resp = await secureProxiedFetch(normalizeBaseUrl(baseUrl).replace("/v1", "") + "/v1/user/info", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env, 10000);
         if (resp.ok) {
             const d = await resp.json();
             const bal = parseFloat(d.data?.balance);
@@ -43,7 +43,7 @@ const balanceCheckers = {
         const resp = await secureProxiedFetch(
             normalizeBaseUrl(baseUrl).replace("/v1", "") + "/user/balance",
             { method: "GET", headers: { Authorization: "Bearer " + token, Accept: "application/json" } },
-            region, env
+            region, env, 10000
         );
         if (resp.ok) {
             const d = await resp.json();
@@ -61,7 +61,7 @@ const balanceCheckers = {
         return BALANCE_UNAVAILABLE;
     },
     async checkMoonshotBalance(token, baseUrl, region, env) {
-        const balanceResponse = await secureProxiedFetch(normalizeBaseUrl(baseUrl) + "/users/me/balance", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env);
+        const balanceResponse = await secureProxiedFetch(normalizeBaseUrl(baseUrl) + "/users/me/balance", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env, 10000);
         if (balanceResponse.ok) {
             const data = await balanceResponse.json();
             return {
@@ -76,7 +76,7 @@ const balanceCheckers = {
         const response = await secureProxiedFetch(
             creditsUrl,
             { method: "GET", headers: { Authorization: "Bearer " + token } },
-            region, env
+            region, env, 10000
         );
         if (response.ok) {
             const d = await response.json();
@@ -170,11 +170,16 @@ async function _checkTokenTemplate(token, providerMeta, providerConfig, env, str
                     if (done) return { token, isValid: false, message: "验证失败 (流提前结束)", error: true };
                     result.rawResponse = { note: "Validation successful via streaming." };
                 } finally {
-                    // 确保正确释放资源
-                    await reader.cancel().catch((err) => {
-                        console.warn('Stream cancel failed:', err.message);
-                    });
-                    reader.releaseLock();
+                    try {
+                        await reader.cancel();
+                    } catch (_) {
+                        // cancel 失败时忽略，releaseLock 会确保资源释放
+                    }
+                    try {
+                        reader.releaseLock();
+                    } catch (_) {
+                        // 极端情况下 releaseLock 也可能失败，确保不影响主流程
+                    }
                 }
             } else {
                 result.rawResponse = await response.json().catch(() => ({ note: "Failed to parse JSON response." }));
@@ -215,17 +220,18 @@ const apiStrategies = {
             const body = {
                 model,
                 messages: [{ role: "user", content: validationPrompt || "Hi" }],
-                max_tokens: validationMaxTokens || 1,
+                max_completion_tokens: validationMaxTokens || 16,
                 stream: enableStream || false
             };
             return { url: apiUrl, options: { method: "POST", headers, body: JSON.stringify(body) } };
         },
         onFail: async (error, token, providerConfig, env) => {
-            if (error.rawError?.content?.error?.code === 'unsupported_parameter' && error.rawError?.content?.error?.param === 'max_tokens') {
+            // 如果 max_completion_tokens 不支持，回退到 max_tokens（兼容旧模型）
+            if (error.rawError?.content?.error?.code === 'unsupported_parameter' && error.rawError?.content?.error?.param === 'max_completion_tokens') {
                 const { url, options } = apiStrategies.openai.buildRequest(token, providerConfig);
                 const newBody = JSON.parse(options.body);
-                delete newBody.max_tokens;
-                newBody.max_completion_tokens = providerConfig.validationMaxOutputTokens || 16;
+                delete newBody.max_completion_tokens;
+                newBody.max_tokens = providerConfig.validationMaxTokens || 16;
                 options.body = JSON.stringify(newBody);
                 const retryStrategy = { buildRequest: () => ({ url, options }) };
                 return await _checkTokenTemplate(token, {}, providerConfig, env, retryStrategy);
@@ -259,7 +265,7 @@ const apiStrategies = {
             };
             const body = {
                 model,
-                max_tokens: validationMaxTokens || 1,
+                max_tokens: validationMaxTokens || 16,
                 messages: [{ role: "user", content: validationPrompt || "You just need to reply Hi." }],
                 stream: enableStream || false,
             };
@@ -270,7 +276,8 @@ const apiStrategies = {
         buildRequest: (token, providerConfig) => {
             const { baseUrl, model, enableStream, validationPrompt, validationMaxOutputTokens } = providerConfig;
             const endpoint = enableStream ? 'streamGenerateContent' : 'generateContent';
-            const apiUrl = `${normalizeBaseUrl(baseUrl)}/v1beta/models/${model}:${endpoint}`;
+            const streamParam = enableStream ? '?alt=sse' : '';
+            const apiUrl = `${normalizeBaseUrl(baseUrl)}/v1beta/models/${model}:${endpoint}${streamParam}`;
             const headers = { "Content-Type": "application/json", "x-goog-api-key": token };
             const body = {
                 contents: [{ parts: [{ text: validationPrompt || "You just need to reply Hi." }] }],

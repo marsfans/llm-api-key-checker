@@ -42,7 +42,7 @@ const filteredModels = computed(() => {
  * @param {string} model - 选中的模型 ID。
  */
 const selectModel = (model) => {
-    configStore.providerConfigs[configStore.currentProvider].model = model;
+    configStore.getCurrentProviderConfig().model = model;
     uiStore.showToast(`已选择模型: ${model}`, "info", 2000);
     uiStore.closeModal();
 };

@@ -37,7 +37,7 @@ const checkerStore = useCheckerStore();
  * @description 计算属性，获取当前选中提供商的配置。
  */
 const currentConfig = computed(() => {
-    return configStore.providerConfigs[configStore.currentProvider];
+    return configStore.getCurrentProviderConfig();
 });
 
 /**
