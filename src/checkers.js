@@ -13,7 +13,7 @@ const BALANCE_UNAVAILABLE = { balance: -1, message: "有效但无法获取余额
 const balanceCheckers = {
     async checkOpenRouterBalance(token, baseUrl, region, env) {
         const creditsUrl = normalizeBaseUrl(baseUrl).replace("/v1", "") + "/v1/credits";
-        const creditsResponse = await secureProxiedFetch(creditsUrl, { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env);
+        const creditsResponse = await secureProxiedFetch(creditsUrl, { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env, 10000);
         if (creditsResponse.ok) {
             const d = await creditsResponse.json();
             const total = d.data?.total_credits || 0;
@@ -28,7 +28,7 @@ const balanceCheckers = {
         return BALANCE_UNAVAILABLE;
     },
     async checkSiliconFlowBalance(token, baseUrl, region, env) {
-        const resp = await secureProxiedFetch(normalizeBaseUrl(baseUrl).replace("/v1", "") + "/v1/user/info", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env);
+        const resp = await secureProxiedFetch(normalizeBaseUrl(baseUrl).replace("/v1", "") + "/v1/user/info", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env, 10000);
         if (resp.ok) {
             const d = await resp.json();
             const bal = parseFloat(d.data?.balance);
@@ -43,7 +43,7 @@ const balanceCheckers = {
         const resp = await secureProxiedFetch(
             normalizeBaseUrl(baseUrl).replace("/v1", "") + "/user/balance",
             { method: "GET", headers: { Authorization: "Bearer " + token, Accept: "application/json" } },
-            region, env
+            region, env, 10000
         );
         if (resp.ok) {
             const d = await resp.json();
@@ -61,7 +61,7 @@ const balanceCheckers = {
         return BALANCE_UNAVAILABLE;
     },
     async checkMoonshotBalance(token, baseUrl, region, env) {
-        const balanceResponse = await secureProxiedFetch(normalizeBaseUrl(baseUrl) + "/users/me/balance", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env);
+        const balanceResponse = await secureProxiedFetch(normalizeBaseUrl(baseUrl) + "/users/me/balance", { method: "GET", headers: { Authorization: "Bearer " + token } }, region, env, 10000);
         if (balanceResponse.ok) {
             const data = await balanceResponse.json();
             return {
@@ -76,7 +76,7 @@ const balanceCheckers = {
         const response = await secureProxiedFetch(
             creditsUrl,
             { method: "GET", headers: { Authorization: "Bearer " + token } },
-            region, env
+            region, env, 10000
         );
         if (response.ok) {
             const d = await response.json();
@@ -100,7 +100,7 @@ const balanceCheckers = {
 /**
  * @description 统一处理上游 API 的错误响应，提取关键错误信息。
  * @param {Response} response - fetch API 返回的 Response 对象。
- * @returns {Promise<{message: string, rawError: object}>} - 包含格式化消息和原始错误的对象。
+ * @returns {Promise<{message: string, rawError: object, errorCategory: string}>} - 包含格式化消息、原始错误和错误分类的对象。
  */
 async function handleApiError(response) {
     const rawText = await response.text();
@@ -111,13 +111,38 @@ async function handleApiError(response) {
         rawErrorContent = rawText;
     }
     let message;
+    let errorCategory = 'unknown';
     const reason = rawErrorContent?.error?.details?.[0]?.reason;
     const code = rawErrorContent?.error?.code;
+    const errorType = rawErrorContent?.error?.type;
     const errorMessage = rawErrorContent?.error?.message;
     const topLevelMessage = rawErrorContent?.message;
     const detail = rawErrorContent?.detail;
+    const lowerCaseContent = JSON.stringify(rawErrorContent).toLowerCase();
 
-    if (reason) {
+    // 优先级从高到低进行错误分类
+    if (response.status === 401 || code === 'invalid_api_key' || errorType === 'invalid_api_key') {
+        message = "API Key 无效或格式错误";
+        errorCategory = 'invalid_key';
+    } else if (errorType === 'access_terminated' || lowerCaseContent.includes('terminated') || lowerCaseContent.includes('banned')) {
+        message = "账户已被封禁或停用";
+        errorCategory = 'account_banned';
+    } else if (response.status === 402 || code === 'insufficient_quota' || errorType === 'insufficient_quota') {
+        message = "额度不足";
+        errorCategory = 'no_quota';
+    } else if (response.status === 429) {
+        message = "请求频繁 (Rate Limit)";
+        errorCategory = 'rate_limit';
+    } else if (response.status === 403 || lowerCaseContent.includes('permission') || lowerCaseContent.includes('forbidden')) {
+        message = "访问被拒绝 (权限不足)";
+        errorCategory = 'permission_denied';
+    } else if (lowerCaseContent.includes('location') || lowerCaseContent.includes('region') || lowerCaseContent.includes('country')) {
+        message = "区域限制";
+        errorCategory = 'region_blocked';
+    } else if (code === 'model_not_found' || lowerCaseContent.includes('model') && lowerCaseContent.includes('not found')) {
+        message = "模型不存在或不可用";
+        errorCategory = 'model_not_found';
+    } else if (reason) {
         message = String(reason);
     } else if (code && isNaN(code)) {
         message = String(code);
@@ -129,16 +154,13 @@ async function handleApiError(response) {
         message = String(rawErrorContent.errors.message);
     } else if (detail) {
         message = typeof detail === 'object' ? JSON.stringify(detail) : String(detail);
-    } else if (response.status === 401) {
-        message = "认证失败";
-    } else if (response.status === 429) {
-        message = "请求频繁";
     } else {
         message = `HTTP ${response.status}`;
     }
 
     return {
         message,
+        errorCategory,
         rawError: {
             status: response.status,
             content: rawErrorContent,
@@ -170,11 +192,16 @@ async function _checkTokenTemplate(token, providerMeta, providerConfig, env, str
                     if (done) return { token, isValid: false, message: "验证失败 (流提前结束)", error: true };
                     result.rawResponse = { note: "Validation successful via streaming." };
                 } finally {
-                    // 确保正确释放资源
-                    await reader.cancel().catch((err) => {
-                        console.warn('Stream cancel failed:', err.message);
-                    });
-                    reader.releaseLock();
+                    try {
+                        await reader.cancel();
+                    } catch (_) {
+                        // cancel 失败时忽略，releaseLock 会确保资源释放
+                    }
+                    try {
+                        reader.releaseLock();
+                    } catch (_) {
+                        // 极端情况下 releaseLock 也可能失败，确保不影响主流程
+                    }
                 }
             } else {
                 result.rawResponse = await response.json().catch(() => ({ note: "Failed to parse JSON response." }));
@@ -215,17 +242,18 @@ const apiStrategies = {
             const body = {
                 model,
                 messages: [{ role: "user", content: validationPrompt || "Hi" }],
-                max_tokens: validationMaxTokens || 1,
+                max_completion_tokens: validationMaxTokens || 16,
                 stream: enableStream || false
             };
             return { url: apiUrl, options: { method: "POST", headers, body: JSON.stringify(body) } };
         },
         onFail: async (error, token, providerConfig, env) => {
-            if (error.rawError?.content?.error?.code === 'unsupported_parameter' && error.rawError?.content?.error?.param === 'max_tokens') {
+            // 如果 max_completion_tokens 不支持，回退到 max_tokens（兼容旧模型）
+            if (error.rawError?.content?.error?.code === 'unsupported_parameter' && error.rawError?.content?.error?.param === 'max_completion_tokens') {
                 const { url, options } = apiStrategies.openai.buildRequest(token, providerConfig);
                 const newBody = JSON.parse(options.body);
-                delete newBody.max_tokens;
-                newBody.max_completion_tokens = providerConfig.validationMaxOutputTokens || 16;
+                delete newBody.max_completion_tokens;
+                newBody.max_tokens = providerConfig.validationMaxTokens || 16;
                 options.body = JSON.stringify(newBody);
                 const retryStrategy = { buildRequest: () => ({ url, options }) };
                 return await _checkTokenTemplate(token, {}, providerConfig, env, retryStrategy);
@@ -259,7 +287,7 @@ const apiStrategies = {
             };
             const body = {
                 model,
-                max_tokens: validationMaxTokens || 1,
+                max_tokens: validationMaxTokens || 16,
                 messages: [{ role: "user", content: validationPrompt || "You just need to reply Hi." }],
                 stream: enableStream || false,
             };
@@ -275,6 +303,20 @@ const apiStrategies = {
             const body = {
                 contents: [{ parts: [{ text: validationPrompt || "You just need to reply Hi." }] }],
                 generationConfig: { maxOutputTokens: validationMaxOutputTokens || 16 }
+            };
+            return { url: apiUrl, options: { method: "POST", headers, body: JSON.stringify(body) } };
+        }
+    },
+    tavily: {
+        buildRequest: (token, providerConfig) => {
+            const { baseUrl } = providerConfig;
+            const apiUrl = normalizeBaseUrl(baseUrl) + "/search";
+            const headers = { "Content-Type": "application/json" };
+            const body = {
+                api_key: token,
+                query: "test",
+                search_depth: "basic",
+                max_results: 1
             };
             return { url: apiUrl, options: { method: "POST", headers, body: JSON.stringify(body) } };
         }
@@ -295,6 +337,10 @@ async function checkAnthropicToken(token, providerMeta, providerConfig, env) {
 
 async function checkGeminiToken(token, providerMeta, providerConfig, env) {
     return await _checkTokenTemplate(token, providerMeta, providerConfig, env, apiStrategies.gemini);
+}
+
+async function checkTavilyToken(token, providerMeta, providerConfig, env) {
+    return await _checkTokenTemplate(token, providerMeta, providerConfig, env, apiStrategies.tavily);
 }
 
 /**
@@ -320,6 +366,9 @@ export async function checkToken(token, providerMeta, providerConfig, env) {
             break;
         case "gemini":
             checkerFunction = checkGeminiToken;
+            break;
+        case "tavily":
+            checkerFunction = checkTavilyToken;
             break;
         default:
             return { token, isValid: false, message: "不支持的提供商类型", error: true };

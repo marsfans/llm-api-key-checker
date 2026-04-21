@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref, reactive, computed, shallowRef, triggerRef } from 'vue';
 import { useConfigStore } from './config';
+import { RESULT_CATEGORIES } from '@/constants';
 
 /**
  * @description HTML 转义函数，防止 XSS 攻击。
@@ -87,7 +88,7 @@ const displayTextFormatters = {
 };
 
 /** @description 所有结果类别的枚举 */
-const CATEGORIES = ['valid', 'lowBalance', 'zeroBalance', 'noQuota', 'rateLimit', 'invalid', 'duplicate'];
+const CATEGORIES = RESULT_CATEGORIES;
 
 /**
  * @description results Store 用于管理 API Key 检测结果的显示和排序。

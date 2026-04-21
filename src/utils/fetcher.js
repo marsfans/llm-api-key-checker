@@ -12,9 +12,10 @@ const uaManager = new UserAgentManager();
  * @param {RequestInit} options - fetch 请求的选项。
  * @param {string} region - 指定的区域名称，用于 Durable Object 代理。
  * @param {object} env - Cloudflare Worker 的环境变量。
+ * @param {number} [timeout=30000] - 请求超时时间（毫秒），默认 30 秒。
  * @returns {Promise<Response>} - fetch 请求的响应。
  */
-export async function secureProxiedFetch(url, options, region, env) {
+export async function secureProxiedFetch(url, options, region, env, timeout = 30000) {
     if (!validateTargetUrl(url)) {
         return new Response(JSON.stringify({ error: { message: 'Invalid or forbidden target URL' } }), {
             status: 400,
@@ -37,42 +38,56 @@ export async function secureProxiedFetch(url, options, region, env) {
         if (randomAcceptLanguage) finalHeaders['accept-language'] = randomAcceptLanguage;
     }
 
-    const finalOptions = { ...options, headers: finalHeaders };
+    // 添加超时控制
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
 
-    // 如果没有指定区域或没有 Durable Object 绑定，则直接发起请求
-    if (!region || !env.REGIONAL_FETCHER) {
-        return fetch(url, finalOptions);
-    }
+    const finalOptions = { ...options, headers: finalHeaders, signal: controller.signal };
 
-    // 通过 Durable Object 进行区域代理
     try {
-        const doId = env.REGIONAL_FETCHER.idFromName(region);
-        const doStub = env.REGIONAL_FETCHER.get(doId, { location: region });
+        let response;
+        // 如果没有指定区域或没有 Durable Object 绑定，则直接发起请求
+        if (!region || !env.REGIONAL_FETCHER) {
+            response = await fetch(url, finalOptions);
+        } else {
+            // 通过 Durable Object 进行区域代理
+            try {
+                const doId = env.REGIONAL_FETCHER.idFromName(region);
+                const doStub = env.REGIONAL_FETCHER.get(doId, { location: region });
 
-        // 将请求的详细信息作为 payload 发送给 Durable Object
-        const payload = {
-            targetUrl: url,
-            method: finalOptions.method,
-            headers: finalOptions.headers,
-            body: finalOptions.body,
-        };
-        
-        // 【优化】为了让内部代理请求的日志更具可读性，将目标主机名添加到内部 URL 中。
-        // 这会将日志条目从 "POST http://do.internal/proxy" 变为类似 "POST http://do.internal/proxy/api.openai.com"
-        // 这不会影响 Durable Object 的功能，因为 DO stub 的 fetch 调用不关心这个内部 URL 的路径。
-        const targetHostname = new URL(url).hostname;
-        const internalUrl = `http://do.internal/proxy/${targetHostname}`;
+                const payload = {
+                    targetUrl: url,
+                    method: finalOptions.method,
+                    headers: finalOptions.headers,
+                    body: finalOptions.body,
+                };
 
-        const proxyRequestToDO = new Request(internalUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-        });
+                const targetHostname = new URL(url).hostname;
+                const internalUrl = `http://do.internal/proxy/${targetHostname}`;
 
-        return doStub.fetch(proxyRequestToDO);
+                const proxyRequestToDO = new Request(internalUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(payload),
+                    signal: controller.signal
+                });
+
+                response = await doStub.fetch(proxyRequestToDO);
+            } catch (error) {
+                console.error(`Durable Object fetch failed for region ${region}:`, error);
+                response = await fetch(url, finalOptions);
+            }
+        }
+        clearTimeout(timeoutId);
+        return response;
     } catch (error) {
-        console.error(`Durable Object fetch failed for region ${region}:`, error);
-        // 如果 Durable Object 调用失败，则回退到直接发起请求
-        return fetch(url, finalOptions);
+        clearTimeout(timeoutId);
+        if (error.name === 'AbortError') {
+            return new Response(JSON.stringify({ error: { message: 'Request timeout' } }), {
+                status: 408,
+                headers: { 'Content-Type': 'application/json' },
+            });
+        }
+        throw error;
     }
 }

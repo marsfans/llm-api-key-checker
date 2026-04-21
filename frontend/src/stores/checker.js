@@ -3,12 +3,15 @@ import { ref, computed } from 'vue';
 import { useConfigStore } from './config';
 import { useResultsStore } from './results';
 import { categorizeTokenError } from '@/api';
-import { MAX_KEYS_LIMIT } from '@/constants';
-
-/**
- * @description 每个批次发送到后端的 Key 的数量。
- */
-const BATCH_SIZE = 500;
+import {
+    MAX_KEYS_LIMIT,
+    BATCH_SIZE,
+    MAX_RECONNECT_ATTEMPTS,
+    BUFFER_FLUSH_INTERVAL,
+    BUFFER_MAX_SIZE,
+    RESULT_CATEGORIES
+} from '@/constants';
+import { parseKeys } from '@/utils/keyParser';
 
 /**
  * @description checker Store 用于管理 API Key 检测的核心逻辑和状态。
@@ -31,16 +34,18 @@ export const useCheckerStore = defineStore('checker', () => {
     const completedCount = ref(0);
     /** @type {Ref<number>} 待检测 Key 的总数。*/
     const totalTasks = ref(0);
-    /** @type {Ref<WebSocket|null>} 当前批次的 WebSocket 连接实例。*/
+    /** @type {Ref<WebSocket|null>} 当前会话的 WebSocket 连接实例（跨批次复用）。*/
     const socket = ref(null);
     /** @type {Ref<object|null>} 用于向 UI 层传递状态消息的对象。*/
     const lastStatusMessage = ref(null);
     /** @type {number} WebSocket 重连尝试次数。*/
     let reconnectAttempts = 0;
-    /** @type {number} 最大重连尝试次数。*/
-    const MAX_RECONNECT_ATTEMPTS = 3;
     /** @type {Array<object>|null} 当前正在处理的批次，用于重连时恢复。*/
     let currentBatch = null;
+    /** @type {Function|null} 当前批次完成时的 resolve 回调。*/
+    let batchDoneResolve = null;
+    /** @type {Set<number>} 已完成的 order 集合，用于断线恢复时去重。*/
+    let completedOrders = new Set();
 
     // --- 内存任务队列 (Memory-based Job Queue) ---
     /**
@@ -54,10 +59,6 @@ export const useCheckerStore = defineStore('checker', () => {
     let resultBuffer = [];
     /** @type {number|null} 缓冲区刷新定时器 ID。*/
     let flushTimerId = null;
-    /** @type {number} 缓冲区刷新间隔（毫秒）。*/
-    const BUFFER_FLUSH_INTERVAL = 100;
-    /** @type {number} 缓冲区最大容量，超过此值立即刷新。*/
-    const BUFFER_MAX_SIZE = 50;
 
     // --- 计算属性 (Getters) ---
     /** @type {ComputedRef<number>} 检测进度百分比。*/
@@ -80,15 +81,14 @@ export const useCheckerStore = defineStore('checker', () => {
     /**
      * @description 主调度函数，从内存队列读取任务状态，处理下一个批次或完成任务。
      */
-    function processNextBatch() {
-        if (isPaused.value) {
-            return; // 如果处于暂停状态，则不启动新批次
-        }
+    async function processNextBatch() {
+        if (isPaused.value) return;
 
-        // 重置重连计数器（新批次开始）
         reconnectAttempts = 0;
 
         if (!jobQueue || jobQueue.remainingKeys.length === 0) {
+            // 所有批次处理完毕，通知后端关闭连接
+            _closeSocket('done');
             finishCheck();
             return;
         }
@@ -96,92 +96,178 @@ export const useCheckerStore = defineStore('checker', () => {
         const batch = jobQueue.remainingKeys.slice(0, BATCH_SIZE);
         const remaining = jobQueue.remainingKeys.slice(BATCH_SIZE);
 
-        // 保存当前批次以便重连时恢复
         currentBatch = { batch, providerConfig: jobQueue.providerConfig, concurrency: jobQueue.concurrency };
-
-        // 更新队列
         jobQueue.remainingKeys = remaining;
 
         _postStatus(`正在处理 ${totalTasks.value - remaining.length} / ${totalTasks.value} 个 Key...`, "info");
 
-        _connectWebSocket(jobQueue.providerConfig, batch, jobQueue.concurrency);
+        try {
+            // 确保 WebSocket 连接可用
+            await _ensureConnection();
+            // 发送批次并等待完成
+            await _sendBatchAndWait(jobQueue.providerConfig, batch, jobQueue.concurrency);
+            currentBatch = null;
+            // 处理下一个批次
+            processNextBatch();
+        } catch (err) {
+            // 连接失败，尝试重连
+            if (isChecking.value && !isPaused.value) {
+                _handleConnectionFailure();
+            }
+        }
     }
 
     /**
-     * @description 创建 WebSocket 连接。
-     * @param {object} providerConfig - 当前任务的提供商配置。
-     * @param {Array<object>} batch - 当前要处理的 Key 批次。
-     * @param {number} concurrency - 并发数。
+     * @description 确保 WebSocket 连接已建立且处于 OPEN 状态。
+     * @returns {Promise<void>}
      */
-    function _connectWebSocket(providerConfig, batch, concurrency) {
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const host = window.location.host;
-        socket.value = new WebSocket(`${protocol}//${host}/check`);
-        setupSocketListeners(providerConfig, batch, concurrency);
-    }
+    function _ensureConnection() {
+        return new Promise((resolve, reject) => {
+            if (socket.value && socket.value.readyState === WebSocket.OPEN) {
+                resolve();
+                return;
+            }
 
-    /**
-     * @description 为单个批次的 WebSocket 连接设置监听器。
-     * @param {object} providerConfig - 当前任务的提供商配置。
-     * @param {Array<object>} batch - 当前要处理的 Key 批次。
-     * @param {number} concurrency - 并发数。
-     */
-    function setupSocketListeners(providerConfig, batch, concurrency) {
-        if (!socket.value) return;
+            // 关闭旧连接（如果有）
+            _cleanupSocket();
 
-        socket.value.onopen = () => {
-            socket.value.send(JSON.stringify({
-                command: 'start',
-                data: {
-                    tokens: batch,
-                    providerConfig,
-                    concurrency,
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.host;
+            const ws = new WebSocket(`${protocol}//${host}/check`);
+
+            ws.onopen = () => {
+                socket.value = ws;
+                _setupMessageHandler(ws);
+                resolve();
+            };
+
+            ws.onerror = () => {
+                reject(new Error('WebSocket connection failed'));
+            };
+
+            // 如果在连接过程中关闭
+            ws.onclose = (event) => {
+                if (event.code !== 1000 && socket.value === ws) {
+                    reject(new Error('WebSocket closed during connection'));
                 }
-            }));
-        };
+            };
+        });
+    }
 
-        socket.value.onmessage = (event) => {
+    /**
+     * @description 为 WebSocket 设置消息处理器。
+     * @param {WebSocket} ws - WebSocket 实例。
+     */
+    function _setupMessageHandler(ws) {
+        ws.onmessage = (event) => {
             const message = JSON.parse(event.data);
             if (message.type === 'result') {
                 processResult(message.data);
-                // 从当前批次中移除已处理的 Key
                 if (currentBatch) {
                     currentBatch.batch = currentBatch.batch.filter(k => k.order !== message.data.order);
                 }
-            } else if (message.type === 'done') {
-                currentBatch = null; // 批次完成，清空缓存
-                socket.value.close(1000, 'Batch done, processing next.');
-                setTimeout(processNextBatch, 100);
-            } else if (message.type === 'error') {
-                 _postStatus(`后端错误: ${message.message}`, "error");
-                 stopCheck();
-            }
-        };
-
-        socket.value.onclose = (event) => {
-            // 仅当任务未暂停且非正常关闭时，才视为意外中断
-            if (event.code !== 1000 && isChecking.value && !isPaused.value) {
-                // 尝试重连
-                if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && currentBatch && currentBatch.batch.length > 0) {
-                    reconnectAttempts++;
-                    _postStatus(`连接断开，正在重试 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, "warning");
-                    setTimeout(() => {
-                        if (isChecking.value && !isPaused.value) {
-                            _connectWebSocket(currentBatch.providerConfig, currentBatch.batch, currentBatch.concurrency);
-                        }
-                    }, 1000 * reconnectAttempts); // 指数退避
-                } else {
-                    _postStatus("检测连接意外关闭，重连失败，任务已停止。", "error");
-                    stopCheck();
+            } else if (message.type === 'batch_done') {
+                // 批次完成，触发 resolve 让 processNextBatch 继续
+                if (batchDoneResolve) {
+                    batchDoneResolve();
+                    batchDoneResolve = null;
                 }
+            } else if (message.type === 'error') {
+                _postStatus(`后端错误: ${message.message}`, "error");
+                stopCheck();
             }
         };
 
-        socket.value.onerror = (event) => {
-            console.error("WebSocket Error:", event);
-            // onerror 后通常会触发 onclose，所以这里只记录日志
-            // 实际的重连逻辑在 onclose 中处理
+        ws.onclose = (event) => {
+            if (event.code !== 1000 && isChecking.value && !isPaused.value) {
+                _handleConnectionFailure();
+            }
         };
+
+        ws.onerror = () => {
+            // onerror 后通常会触发 onclose，实际重连逻辑在 onclose 中处理
+        };
+    }
+
+    /**
+     * @description 发送一个批次到后端并等待 batch_done 消息。
+     * @param {object} providerConfig - 提供商配置。
+     * @param {Array<object>} batch - 当前批次的 Key 列表。
+     * @param {number} concurrency - 并发数。
+     * @returns {Promise<void>}
+     */
+    function _sendBatchAndWait(providerConfig, batch, concurrency) {
+        return new Promise((resolve, reject) => {
+            batchDoneResolve = resolve;
+
+            if (!socket.value || socket.value.readyState !== WebSocket.OPEN) {
+                reject(new Error('WebSocket not connected'));
+                return;
+            }
+
+            socket.value.send(JSON.stringify({
+                command: 'start',
+                data: { tokens: batch, providerConfig, concurrency }
+            }));
+        });
+    }
+
+    /**
+     * @description 处理连接失败，尝试重连。
+     */
+    function _handleConnectionFailure() {
+        if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS && currentBatch && currentBatch.batch.length > 0) {
+            reconnectAttempts++;
+            _postStatus(`连接断开，正在重试 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`, "warning");
+            _cleanupSocket();
+
+            // 过滤掉已完成的 Key，避免重复检测
+            const unfinishedBatch = currentBatch.batch.filter(k => !completedOrders.has(k.order));
+
+            // 将未完成的批次放回队列
+            if (jobQueue && unfinishedBatch.length > 0) {
+                jobQueue.remainingKeys = [...unfinishedBatch, ...jobQueue.remainingKeys];
+            }
+            currentBatch = null;
+
+            setTimeout(() => {
+                if (isChecking.value && !isPaused.value) {
+                    processNextBatch();
+                }
+            }, 1000 * reconnectAttempts);
+        } else {
+            _postStatus("检测连接意外关闭，重连失败，任务已停止。", "error");
+            stopCheck();
+        }
+    }
+
+    /**
+     * @description 清理 WebSocket 连接，移除事件监听器。
+     */
+    function _cleanupSocket() {
+        if (socket.value) {
+            socket.value.onopen = null;
+            socket.value.onmessage = null;
+            socket.value.onclose = null;
+            socket.value.onerror = null;
+            socket.value = null;
+        }
+        batchDoneResolve = null;
+    }
+
+    /**
+     * @description 关闭 WebSocket 连接。
+     * @param {string} [command] - 关闭前发送的命令（如 'done' 或 'stop'）。
+     */
+    function _closeSocket(command) {
+        if (socket.value && socket.value.readyState === WebSocket.OPEN) {
+            if (command) {
+                try { socket.value.send(JSON.stringify({ command })); } catch (_) {}
+            }
+            socket.value.onclose = null;
+            socket.value.close(1000, command === 'done' ? 'All batches complete' : 'Client closed');
+        }
+        _cleanupSocket();
     }
 
     /**
@@ -230,6 +316,10 @@ export const useCheckerStore = defineStore('checker', () => {
      */
     function processResult(res) {
         if (!res) return;
+
+        // 记录已完成的 order，用于断线恢复去重
+        completedOrders.add(res.order);
+
         completedCount.value++;
         const { category } = categorizeTokenError(res);
         res.finalCategory = category;
@@ -252,9 +342,10 @@ export const useCheckerStore = defineStore('checker', () => {
         flushResultBuffer();
 
         isChecking.value = false;
-        // 清理内存队列
+        // 清理内存队列和去重集合
         jobQueue = null;
         currentBatch = null;
+        completedOrders.clear();
 
         // 定义分类 ID 到中文名称的映射
         const categoryMap = {
@@ -305,12 +396,13 @@ export const useCheckerStore = defineStore('checker', () => {
             return;
         }
 
-        // 清理旧任务
+        // 清理旧任务和去重集合
         jobQueue = null;
+        completedOrders.clear();
         resultsStore.clearResults();
         completedCount.value = 0;
 
-        const tokensRaw = configStore.tokensInput.trim().split(/[,;\n\r]+/).map(t => t.trim()).filter(Boolean);
+        const tokensRaw = parseKeys(configStore.tokensInput);
 
         // 检查 Key 数量限制
         if (tokensRaw.length > MAX_KEYS_LIMIT) {
@@ -349,7 +441,7 @@ export const useCheckerStore = defineStore('checker', () => {
         totalTasks.value = keysToProcess.length;
 
         const currentProviderKey = configStore.currentProvider;
-        const providerSettings = configStore.providerConfigs[currentProviderKey];
+        const providerSettings = configStore.getCurrentProviderConfig();
         const providerConfig = {
             provider: currentProviderKey,
             baseUrl: providerSettings.baseUrl,
@@ -376,33 +468,25 @@ export const useCheckerStore = defineStore('checker', () => {
      * @description 停止当前检测任务，清理会话状态。
      */
     function stopCheck() {
-        // 刷新缓冲区中剩余的结果
         flushResultBuffer();
 
         isChecking.value = false;
         isPaused.value = false;
-        // 清理内存队列
         jobQueue = null;
         currentBatch = null;
-        if (socket.value) {
-            socket.value.onclose = null;
-            socket.value.close(1000, 'User stopped the job.');
-            socket.value = null;
-        }
+        completedOrders.clear();
+        _closeSocket('stop');
         _postStatus("检测已手动停止", "info");
     }
 
     /**
      * @description 暂停当前检测任务。
-     * 通过关闭当前 WebSocket 连接来立即中断后端的批处理。
-     * 未完成的批次会被保存回任务队列，以便恢复时继续处理。
+     * 保持 WebSocket 连接，但停止发送新批次。
      */
     function pauseCheck() {
         if (!isChecking.value || isPaused.value) return;
 
-        // 刷新缓冲区中剩余的结果
         flushResultBuffer();
-
         isPaused.value = true;
 
         // 将当前未完成的批次放回队列头部
@@ -411,14 +495,6 @@ export const useCheckerStore = defineStore('checker', () => {
         }
 
         _postStatus("检测已暂停", "info");
-
-        if (socket.value) {
-            socket.value.onclose = null;
-            socket.value.close(1000, 'User paused the job.');
-            socket.value = null;
-        }
-
-        // 清理当前批次缓存
         currentBatch = null;
     }
 

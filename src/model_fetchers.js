@@ -47,7 +47,7 @@ async function fetchGitHubModels(token, baseUrl, region, env) {
 }
 
 /**
- * @description 从 Google Gemini API 获取模型列表。
+ * @description 从 Google Gemini API 获取模型列表，支持分页。
  * @param {string} token - API Key。
  * @param {string} baseUrl - API 基础 URL。
  * @param {string} region - 区域信息。
@@ -55,26 +55,41 @@ async function fetchGitHubModels(token, baseUrl, region, env) {
  * @returns {Promise<string[]>} - 模型 ID 数组。
  */
 async function fetchGoogleModels(token, baseUrl, region, env) {
-    const apiUrl = `${normalizeBaseUrl(baseUrl)}/v1beta/models`;
-    const response = await secureProxiedFetch(
-        apiUrl,
-        {
-            method: "GET",
-            headers: { "x-goog-api-key": token }
-        },
-        region,
-        env
-    );
+    const allModels = [];
+    let pageToken = null;
 
-    if (!response.ok) {
-        const err = await response.json().catch(() => null);
-        throw new Error(err?.error?.message || `HTTP ${response.status}`);
-    }
+    do {
+        const apiUrl = `${normalizeBaseUrl(baseUrl)}/v1beta/models${pageToken ? `?pageToken=${pageToken}` : ''}`;
+        const response = await secureProxiedFetch(
+            apiUrl,
+            {
+                method: "GET",
+                headers: { "x-goog-api-key": token }
+            },
+            region,
+            env
+        );
 
-    const data = await response.json();
-    return data.models
-        .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && !m.name.includes("embedding"))
-        .map((m) => m.name.replace("models/", ""));
+        if (!response.ok) {
+            const err = await response.json().catch(() => null);
+            throw new Error(err?.error?.message || `HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+        const models = data.models || [];
+
+        // 过滤支持 generateContent 且非 embedding 模型
+        const validModels = models
+            .filter((m) => m.supportedGenerationMethods?.includes("generateContent") && !m.name.includes("embedding"))
+            .map((m) => m.name.replace("models/", ""));
+
+        allModels.push(...validModels);
+
+        // 检查是否有下一页
+        pageToken = data.nextPageToken || null;
+    } while (pageToken);
+
+    return allModels;
 }
 
 /**

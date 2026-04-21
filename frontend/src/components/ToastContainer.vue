@@ -27,6 +27,7 @@ const uiStore = useUiStore();
         flex-direction: column;
         gap: 10px;
         pointer-events: none;
+        max-width: calc(100vw - 40px);
     }
 
     /* 单个 Toast 消息样式 */
@@ -35,10 +36,10 @@ const uiStore = useUiStore();
         border-radius: var(--radius-md);
         padding: 16px 20px;
         display: flex;
-        align-items: center;
+        align-items: flex-start;
         gap: 12px;
         min-width: 280px;
-        max-width: 400px;
+        max-width: 420px;
         box-shadow: var(--shadow-medium);
         transform: translateX(120%);
         transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
@@ -83,6 +84,7 @@ const uiStore = useUiStore();
     /* Toast 内容区域 */
     .toast-content {
         flex: 1;
+        min-width: 0;
     }
 
     .toast-title {
@@ -97,6 +99,8 @@ const uiStore = useUiStore();
         color: var(--text-secondary);
         font-size: 0.9rem;
         line-height: 1.4;
+        overflow-wrap: break-word;
+        word-break: break-word;
     }
 
     /* 关闭按钮 */
@@ -121,11 +125,18 @@ const uiStore = useUiStore();
         color: var(--text-primary);
     }
 
-    /* 媒体查询：超小屏幕宽度优化 */
-    @media (max-width: 360px) {
+    /* 媒体查询：移动端优化 */
+    @media (max-width: 768px) {
+        .toast-container {
+            right: 12px;
+            left: 12px;
+            max-width: none;
+        }
+
         .toast {
-            min-width: 220px;
-            max-width: 88vw;
+            min-width: 0;
+            max-width: none;
+            width: 100%;
         }
     }
 </style>
